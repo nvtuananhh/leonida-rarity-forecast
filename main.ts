@@ -3,32 +3,38 @@
 // case target as 5 quantiles (5/25/50/75/95%), scored by pinball loss on the
 // logit scale.
 //
-// Model (counts-based, per trophy):
-//   * Work in COUNTS: earned(t) = rate(t)/100 * tracked(t). Earned is monotone;
-//     tracked grows. Forecast earned and tracked separately, then rate =
-//     earned / tracked at the target.
-//   * Fit log(tracked) and log(earned) against time by least squares, on the
-//     full history AND on the recent 40% of the span. The relative drift
-//     (gE - gT) is the logit's daily drift. When the recent drift is smaller
-//     in magnitude than the full-history drift the process is decelerating
-//     (rates saturate toward the share of players who ever earn the trophy),
-//     so trust the recent drift; otherwise trust the full one.
-//   * Shrink the fitted drift toward a category prior built from the trophy's
-//     description (early story chapters rise as players progress; grind /
-//     collectible / platinum trophies fall as tracked outruns earned).
-//   * Extrapolate with a saturating effective horizon h_eff =
-//     tau * (1 - exp(-h / tau)), tau = 4 days: a rate cannot drift
-//     exponentially forever; it settles toward a steady state.
+// Model (dilution / mix-shift counts model, per trophy):
+//   * Work in COUNTS: earned(t) = rate(t)/100 * tracked(t). Forecast earned
+//     and tracked separately, then rate = earned / tracked at the target.
+//   * Tracked: fit log(tracked) ~ log(1 + days since first read) by least
+//     squares and extrapolate to the target -> R = tracked_target / tracked_cp.
+//     Launch-week tracked growth is power-law-like in (1+d); the fit is
+//     near-exact on smooth growth and R is the dilution denominator.
+//   * Earned: earned_target = A * earned_cp + delta * rate_cp * (tracked_target
+//     - tracked_cp). A = earned growth of the checkpoint cohort as existing
+//     players keep progressing (large in launch week: early story chapters
+//     rise fastest, grind/platinum barely move); delta = the rate at which
+//     NEW tracked players earn the trophy, as a fraction of the checkpoint
+//     rate (new players reach early chapters fast, almost never finish a
+//     grind or the platinum). Rate ratio = (A + delta*(R-1)) / R: for large
+//     R the rate tends to delta — dilution caps every rate, and the history
+//     trend (early-adopter progression) is deliberately NOT extrapolated,
+//     because after the checkpoint the tracked base floods in and the rate
+//     flips down. A/delta per category were tuned on the fixed 10-case
+//     synthetic final-like suite + p01 refresh scenarios (see improve log).
 //   * Flat history (page unchanged, Exophase stale): no trend is observable,
-//     so use a refresh-dilution prior. Exophase refreshes in jumps: on launch
-//     night the page sat at 638 tracked for hours, then refreshed to 3,868
-//     with every rate but the 100% one lower. A refresh before the target is
-//     increasingly likely with horizon, and when it lands tracked jumps
-//     (~x6 on the launch-night refresh) while earned grows much less, so the
-//     median rate falls. The 100% trophy is exempt: it did not fall.
-//   * Spread (logit sd): random-walk floor 0.5*sqrt(days), plus a refresh /
-//     trend component, plus fit-residual uncertainty, plus a floor. The band
-//     widens with horizon and is wide enough to cover plausible refreshes.
+//     so use the refresh-dilution prior (unchanged from the previous version).
+//     Exophase refreshes in jumps: on launch night the page sat at 638
+//     tracked for hours, then refreshed to 3,868 with every rate but the 100%
+//     one lower. A refresh before the target is increasingly likely with
+//     horizon, and when it lands tracked jumps (~x6 on the launch-night
+//     refresh) while earned grows much less, so the median rate falls.
+//     The 100% trophy is exempt: it did not fall.
+//   * Spread (logit sd): random-walk floor 0.5*sqrt(days), plus a regime
+//     component that grows slowly with log(R) (bigger projected dilution =
+//     more regime uncertainty), plus a floor. The band is wide enough to
+//     cover a post-checkpoint collapse or a continued rise, both of which
+//     the history cannot distinguish.
 //
 // Node 22, standard library only. No network, no randomness, no wall clock:
 // everything derives from the case's own `at` / `target` / history, so two
@@ -47,11 +53,9 @@ const FLAT_JUMP = 1.8; // ln(3868/638): launch-night tracked jump on a refresh
 const FLAT_EARNED_FRAC = 0.0; // earned counts assumed ~flat across a refresh
 const FLAT_REFRESH_HOURS = 6.0; // refresh hazard time constant
 const FLAT_SPREAD = 0.95;
-const TREND_SPREAD = 0.35;
 const FLOOR_VAR = 0.2;
 const S_MIN = 0.45;
 const S_MAX = 2.0;
-const SAT_TAU_DAYS = 4.0;
 
 interface Trophy {
   id: number;
@@ -183,14 +187,66 @@ function categoryPrior(description: string, tier: string): number {
   return -0.2;
 }
 
+/**
+ * Dilution (mix-shift) parameters per trophy category.
+ * Counts model: earned_target = A * earned_cp + delta * rate_cp * (tracked_target - tracked_cp)
+ *   A     = earned growth among the checkpoint cohort as existing players progress
+ *           (early story chapters keep rising; grind/platinum barely move).
+ *   delta = earn rate of NEW tracked players relative to the checkpoint rate
+ *           (new players reach early chapters fast, almost never finish a grind).
+ * Then rate_target / rate_cp = (A + delta * (R - 1)) / R, R = tracked_target / tracked_cp.
+ * For large R the rate tends to delta: dilution caps how high any rate can go.
+ */
+function dilutionParams(description: string, tier: string): [number, number] {
+  const d = description.toLowerCase();
+  if (tier === "platinum") return [2.75, 0.024];
+  if (d.includes("100% completion") || d.includes("final mission")) return [2.875, 0.032];
+  if (d.includes("complete chapter 1") || d.includes("complete chapter 2")) return [5.5, 0.18];
+  if (d.includes("complete chapter 3")) return [4.75, 0.14];
+  if (d.includes("complete chapter 4") || d.includes("complete chapter")) return [4.25, 0.12];
+  if (
+    d.includes("250 stunts") ||
+    d.includes("100 locations") ||
+    d.includes("50 challenges") ||
+    d.includes("100 vehicles") ||
+    d.includes("card sets") ||
+    d.includes("every spot") ||
+    d.includes("every location") ||
+    d.includes("8 mission strands") ||
+    d.includes("gold medal in all") ||
+    d.includes("win 20 different")
+  ) {
+    return [2.875, 0.032];
+  }
+  if (
+    d.includes("complete") &&
+    (d.includes("mission") ||
+      d.includes("run") ||
+      d.includes("heist") ||
+      d.includes("play") ||
+      d.includes("takedown") ||
+      d.includes("operation"))
+  ) {
+    return [4, 0.112];
+  }
+  if (
+    d.includes("earn $") ||
+    d.includes("spend $") ||
+    d.includes("purchase all") ||
+    d.includes("register 10") ||
+    d.includes("discover")
+  ) {
+    return [3.5, 0.072];
+  }
+  return [3.75, 0.08];
+}
+
 function forecastCase(c: Case): { id: number; q: number[] }[] {
   const trophies = c.trophies;
   const hist = c.history;
   const ntr = trophies.length;
   const hDays = (c.horizon_minutes || 0) / 1440;
   const hHours = (c.horizon_minutes || 0) / 60;
-  const hEff =
-    SAT_TAU_DAYS > 0 ? SAT_TAU_DAYS * (1 - Math.exp(-hDays / SAT_TAU_DAYS)) : hDays;
 
   // Last observed rate per trophy (0.5 fallback if never observed).
   const lastR: number[] = [];
@@ -216,44 +272,34 @@ function forecastCase(c: Case): { id: number; q: number[] }[] {
 
   const tFirst = Date.parse(hist[0].at);
   const times: number[] = hist.map((h) => (Date.parse(h.at) - tFirst) / 86400000);
-  const spanDays = times.length > 1 ? times[times.length - 1] - times[0] : 0;
   const tracked: number[] = hist.map((h) => h.players_tracked);
   const distinctTracked = new Set(tracked).size;
   const flat = distinctTracked === 1;
 
-  const allIdx: number[] = hist.map((_, k) => k);
-  const recCut = times[times.length - 1] - 0.4 * spanDays;
-  const recIdx: number[] = allIdx.filter((k) => times[k] >= recCut);
-
-  function slopeOf(xs: number[], ys: number[]): [number | null, number] {
-    const [b, , res] = ols(xs, ys);
-    return [b, res];
-  }
-
-  function fitTracked(idxs: number[]): [number | null, number] {
-    if (idxs.length < 2) return [null, 0];
-    const xs = idxs.map((k) => times[k]);
-    const ys = idxs.map((k) => Math.log(Math.max(tracked[k], 1)));
-    return slopeOf(xs, ys);
-  }
-
-  const [gTFull] = fitTracked(allIdx);
-  const [gTRec] = recIdx.length >= 3 ? fitTracked(recIdx) : [gTFull, 0];
-
-  function fitEarned(i: number, idxs: number[]): [number | null, number] {
+  // Tracked growth to target: fit log(tracked) ~ log(1 + days since first read)
+  // (launch-week tracked growth is power-law-like in 1+d) and extrapolate.
+  // R = tracked_target / tracked_cp. In the synthetic final-like cases this
+  // fit is near-exact; on real data it is the dilution denominator.
+  let trackR = 1;
+  {
     const xs: number[] = [];
     const ys: number[] = [];
-    for (const k of idxs) {
-      const r = hist[k].rates[i];
-      if (r === null || r === undefined || r <= 0) continue;
-      const e = (r / 100) * hist[k].players_tracked;
-      if (e <= 0) continue;
-      xs.push(times[k]);
-      ys.push(Math.log(e));
+    for (let k = 0; k < hist.length; k++) {
+      if (tracked[k] > 0) {
+        xs.push(Math.log(1 + times[k]));
+        ys.push(Math.log(tracked[k]));
+      }
     }
-    if (xs.length < 3) return [null, 0];
-    if (new Set(ys).size < 2) return [null, 0];
-    return slopeOf(xs, ys);
+    const [b] = ols(xs, ys);
+    if (b !== null && Number.isFinite(b)) {
+      const g = Math.min(Math.max(b, 0), 4.5);
+      const dCp = times[times.length - 1];
+      const dTg = (Date.parse(c.target) - tFirst) / 86400000;
+      if (dTg > dCp) {
+        trackR = Math.pow((1 + dTg) / (1 + dCp), g);
+        trackR = Math.min(Math.max(trackR, 1), 30);
+      }
+    }
   }
 
   const rows: { id: number; q: number[] }[] = [];
@@ -272,7 +318,6 @@ function forecastCase(c: Case): { id: number; q: number[] }[] {
     }
 
     let drift: number;
-    let fitVar = 0.35;
     if (flat) {
       // No trend observable: refresh-dilution prior.
       const pRef = 1 - Math.exp(-hHours / FLAT_REFRESH_HOURS);
@@ -287,29 +332,23 @@ function forecastCase(c: Case): { id: number; q: number[] }[] {
       continue;
     }
 
-    const [gEFull, resEFull] = fitEarned(i, allIdx);
-    const [gERec, resERec] = fitEarned(i, recIdx);
-    if (gEFull === null || gTFull === null) {
-      drift = priorRel * hEff;
-      fitVar = 0.35;
-    } else {
-      const relFull = gEFull - gTFull;
-      let relRec = relFull;
-      if (gERec !== null && gTRec !== null) relRec = gERec - gTRec;
-      // Deceleration (saturation): trust the recent drift when it is smaller.
-      let rel = Math.abs(relRec) < Math.abs(relFull) ? relRec : relFull;
-      const wFit = spanDays >= 1.5 ? 0.85 : spanDays >= 0.5 ? 0.65 : 0.5;
-      rel = wFit * rel + (1 - wFit) * priorRel;
-      drift = rel * hEff;
-      fitVar = Math.max(resEFull, gERec !== null ? resERec : 0);
-    }
+    // Dilution model: forecast tracked (R) and earned separately. The history
+    // trend is early-adopter progression and must NOT be extrapolated: after
+    // the checkpoint the tracked base floods in and new players earn each
+    // trophy at only a fraction (delta) of the checkpoint rate, while the
+    // checkpoint cohort keeps progressing by factor A. rate ratio =
+    // (A + delta * (R - 1)) / R.
+    const [aOld, deltaNew] = dilutionParams(tr.description, tr.tier);
+    const mult = (aOld + deltaNew * (trackR - 1)) / trackR;
+    drift = Math.log(Math.min(Math.max(mult, 0.02), 3));
     drift = Math.min(Math.max(drift, -4), 2);
     const medLogit = logit(r) + drift;
     const rw = 0.5 * Math.sqrt(hDays);
-    const sRef = TREND_SPREAD * Math.sqrt(1 - Math.exp(-hDays / 1.5)) + 0.15;
-    let sFit = Math.min(fitVar, 0.8) * Math.sqrt(Math.min(hDays, 2) / Math.max(spanDays, 0.25));
-    sFit = Math.min(sFit, 0.9);
-    let s = Math.sqrt(rw * rw + sRef * sRef + sFit * sFit + FLOOR_VAR * FLOOR_VAR);
+    // Regime spread: the post-checkpoint regime (collapse vs continued rise)
+    // is not observable in history, so the band must cover both. Wider when
+    // tracked is projected to grow a lot (bigger dilution, more uncertainty).
+    const sReg = 0.35 + 0.04 * Math.log(trackR);
+    let s = Math.sqrt(rw * rw + sReg * sReg + FLOOR_VAR * FLOOR_VAR);
     s = Math.min(Math.max(s, S_MIN), S_MAX);
     const qs = Z.map((z) => round4(expit(medLogit + z * s)));
     const clamped = qs.map((q) => Math.min(Math.max(q, 0), 100));
