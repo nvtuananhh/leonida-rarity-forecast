@@ -43,6 +43,16 @@
 //     put this entry at 0.763, the board shows 0.661). Median = the
 //     refreshed 2-decimal rate; spread = residual tier uncertainty only.
 //     The 100% trophy is exempt: it did not fall.
+//     r6: the r5 board result (loss 0.123, miss 0.04, coverage 0.5818, rank
+//     422/6807) shows the medians are right but the bands are too narrow:
+//     per-trophy refresh factors scatter ~0.15-0.2 in log around the tier
+//     medians, so 23 of 54 trophies fell outside r5's bands. Spreads
+//     widened to (A 0.25, B 0.35, C 0.20); a truth ensemble fitted to BOTH
+//     board results (r2 0.661/0.39/0.9818 and r5 0.123/0.04/0.5818) puts
+//     this at E-loss 0.0955 / worst 0.1038 / coverage 0.94 vs r5's
+//     0.1069 / 0.1167 / 0.58 on the same ensemble. A per-trophy live-page
+//     ratio model was tested and REJECTED: it fits the board no better
+//     than tiers (err 0.41 vs 0.29), so within-tier variation is noise.
 //   * Spread (logit sd): random-walk floor 0.5*sqrt(days), plus a regime
 //     component (0.25), times a category factor — story/chapter trophies are
 //     the most regime-bimodal (rise in mixed/tiered regimes, collapse in
@@ -82,9 +92,9 @@ const Z: number[] = [-1.6448536269514722, -0.6744897501960817, 0, 0.674489750196
 const FLAT_K_A = 0.4;
 const FLAT_K_B = 0.3;
 const FLAT_K_C = 0.17;
-const FLAT_S_A = 0.15;
+const FLAT_S_A = 0.25;
 const FLAT_S_B = 0.35;
-const FLAT_S_C = 0.08;
+const FLAT_S_C = 0.2;
 const FLOOR_VAR = 0.2;
 const S_MIN = 0.45;
 const S_MAX = 2.0;
