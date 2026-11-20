@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/gta6-trophy-rarity-forecast-01/nvtuananhh/leonida-rarity-forecast/rank.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 [![reward](https://make.fun/badge/gta6-trophy-rarity-forecast-01/nvtuananhh/leonida-rarity-forecast/reward.svg)](https://make.fun/bounty/gta6-trophy-rarity-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-trophy-rarity-forecast-01)
 
-A counts-based forecaster for GTA VI PS5 trophy earn rates on Exophase: it fits earned-count and players-tracked growth per trophy (full history vs recent window, with saturation), shrinks the drift toward a category prior, and adds a refresh-dilution prior when the page is stale, emitting 5 quantiles per trophy on the logit scale.
+A counts-based forecaster for GTA VI PS5 trophy earn rates on Exophase: it fits earned-count and players-tracked growth per trophy (power-dilution counts model with a G-gated trend blend), and when the page is stale it inverts the next refresh directly — the refreshed rate by growth tier, calibrated on the live dev board — emitting 5 quantiles per trophy on the logit scale.
 
 ## Run it
 

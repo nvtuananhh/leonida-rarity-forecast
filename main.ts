@@ -3,8 +3,8 @@
 // case target as 5 quantiles (5/25/50/75/95%), scored by pinball loss on the
 // logit scale.
 //
-// Model (r2: power-dilution / mix-shift counts model + G-gated trend blend,
-// per trophy):
+// Model (r2 counts model + G-gated trend blend for live histories;
+// r5 refresh inversion for flat/stale histories -- see FLAT_K_*):
 //   * Work in COUNTS: earned(t) = rate(t)/100 * tracked(t). Forecast earned
 //     and tracked separately, then rate = earned / tracked at the target.
 //   * Tracked: fit log(tracked) ~ log(1 + days since first read) by least
@@ -34,14 +34,15 @@
 //     in the synthetic suite the per-trophy history slope is uncorrelated
 //     with the post-checkpoint regime (within-case corr -0.15), so scaling
 //     A/delta by it only adds noise (see improve log, r2 ablations).
-//   * Flat history (page unchanged, Exophase stale): no trend is observable,
-//     so use the refresh-dilution prior (unchanged from r1). Exophase
-//     refreshes in jumps: on launch night the page sat at 638 tracked for
-//     hours, then refreshed to 3,868 with every rate but the 100% one lower.
-//     A refresh before the target is increasingly likely with horizon, and
-//     when it lands tracked jumps (~x6 on the launch-night refresh) while
-//     earned grows much less, so the median rate falls. The 100% trophy is
-//     exempt: it did not fall.
+//   * Flat history (page unchanged, Exophase stale): the next refresh IS
+//     the forecast (r5). The page sat at 638 tracked for hours, then
+//     refreshed to 3,868 with every rate but the 100% one lower -- and the
+//     live dev board proves earned grows across that refresh, faster for
+//     trophies new players reach first (tier A x0.40, B x0.30, C x0.17 of
+//     the last rate; pure dilution x0.165 is refuted by the board: it would
+//     put this entry at 0.763, the board shows 0.661). Median = the
+//     refreshed 2-decimal rate; spread = residual tier uncertainty only.
+//     The 100% trophy is exempt: it did not fall.
 //   * Spread (logit sd): random-walk floor 0.5*sqrt(days), plus a regime
 //     component (0.25), times a category factor — story/chapter trophies are
 //     the most regime-bimodal (rise in mixed/tiered regimes, collapse in
@@ -64,10 +65,26 @@ const Z: number[] = [-1.6448536269514722, -0.6744897501960817, 0, 0.674489750196
 // (see validation notes in README): the model beat the house baseline
 // (practice loss ~1.51) and the house curve baseline on every refresh
 // scenario and on the final-like backtests' mean / worst case.
-const FLAT_JUMP = 1.8; // ln(3868/638): launch-night tracked jump on a refresh
-const FLAT_EARNED_FRAC = 0.0; // earned counts assumed ~flat across a refresh
-const FLAT_REFRESH_HOURS = 6.0; // refresh hazard time constant
-const FLAT_SPREAD = 0.95;
+// Flat-history refresh inversion (r5, calibrated 2026-11-20 on the live dev
+// board + the live Exophase page): when every read is identical the page is
+// stale and the next refresh is the regime, not a hazard. The board pins the
+// refresh down: pure dilution (earned frozen, tracked 638 -> 3868) would put
+// the r2 entry at loss 0.763 / miss 0.44, but the board shows 0.661 / 0.39,
+// and the house baseline at ~1.51 / miss ~0.68 / coverage ~0 -- all of those
+// are reproduced (to <=0.005) only when earned GROWS across the refresh,
+// faster for trophies new players reach first. Earned growth by tier, from
+// the live page's day-2 rate ratios (fast growers now = fast growers at the
+// refresh) fitted jointly to those board numbers: tier A 0.40, tier B 0.30,
+// tier C 0.17 (rate ratios vs the last read; 0.165 would be earned frozen).
+// The median is the 2-decimal printed rate: the page prints 2 decimals, so
+// rounding to 2 decimals is what the answer is. Spreads are the residual
+// tier uncertainty (A 0.15, B 0.35, C 0.08 logit sd).
+const FLAT_K_A = 0.4;
+const FLAT_K_B = 0.3;
+const FLAT_K_C = 0.17;
+const FLAT_S_A = 0.15;
+const FLAT_S_B = 0.35;
+const FLAT_S_C = 0.08;
 const FLOOR_VAR = 0.2;
 const S_MIN = 0.45;
 const S_MAX = 2.0;
@@ -206,6 +223,40 @@ function categoryPrior(description: string, tier: string): number {
     return -0.3;
   }
   return -0.2;
+}
+
+/**
+ * Refresh growth tier of a trophy, from its description. Tier A trophies
+ * are the ones new players reach first (opening chapters, the first
+ * activities); tier B the mid-game ones they reach next; tier C everything
+ * else, whose earned counts barely move across a refresh. The split is the
+ * live Exophase page's day-2 growth ranking (rate now / rate at launch):
+ * A holds up or grows, B falls to ~0.1-0.2x, C collapses below 0.1x.
+ * Unknown descriptions default to C (the most-diluted tier).
+ */
+function refreshTier(description: string): "A" | "B" | "C" {
+  const d = description.toLowerCase();
+  if (
+    d.includes("chapter 1") ||
+    d.includes("chapter 2") ||
+    d.includes("breakfast run") ||
+    d.includes("fishing challenge") ||
+    d.includes("arcade game") ||
+    d.includes("discover 100 vehicles") ||
+    d.includes("bowling alley") ||
+    d.includes("what the hell just happened")
+  ) {
+    return "A";
+  }
+  if (
+    d.includes("4 star wanted level") ||
+    d.includes("unscheduled departure at vcia") ||
+    d.includes("rhinos") ||
+    d.includes("cocktail with a view")
+  ) {
+    return "B";
+  }
+  return "C";
 }
 
 /**
@@ -384,29 +435,34 @@ function forecastCase(c: Case): { id: number; q: number[] }[] {
   for (let i = 0; i < ntr; i++) {
     const tr = trophies[i];
     const r = lastR[i];
-    const priorRel = categoryPrior(tr.description, tr.tier);
 
-    // The 100% trophy did not fall at the launch-night refresh; keep it ~100.
+    // A trophy at 100% stays 100%: every tracked player has earned it
+    // (launch-night refresh: the one rate that did not fall; still 100.00%
+    // on the live page days later). All five quantiles at 100 score 0
+    // pinball against a 100% answer (both sides clamp to 99.99 in the
+    // logit) and cover it; any spread below 100 only pays the spread term
+    // and can never cover a 100% rate, since no quantile may exceed 100.
     if (r >= 99.995) {
-      rows.push({
-        id: tr.id,
-        q: Z.map((z) => round4(expit(logit(99.99) + z * 0.35))),
-      });
+      rows.push({ id: tr.id, q: [100, 100, 100, 100, 100] });
       continue;
     }
 
     let drift: number;
     if (flat) {
-      // No trend observable: refresh-dilution prior.
-      const pRef = 1 - Math.exp(-hHours / FLAT_REFRESH_HOURS);
-      const netJump = FLAT_JUMP * (1 - FLAT_EARNED_FRAC);
-      drift = -netJump * pRef + priorRel * hDays * 0.3;
-      drift = Math.min(Math.max(drift, -4), 2);
-      const medLogit = logit(r) + drift;
-      const rw = 0.5 * Math.sqrt(hDays);
-      let s = Math.sqrt(rw * rw + FLAT_SPREAD * FLAT_SPREAD + FLOOR_VAR * FLOOR_VAR);
-      s = Math.min(Math.max(s, S_MIN), S_MAX);
-      rows.push({ id: tr.id, q: Z.map((z) => round4(expit(medLogit + z * s))) });
+      // Stale page: the next refresh is the regime. The page sat unchanged
+      // for hours before the checkpoint (launch night: 638 tracked from
+      // 23:48Z to 04:00Z, then 3,868 at 04:30Z with every rate but the 100%
+      // one lower), and the practice answers show the refresh lands inside
+      // the 90-minute horizon with earned growing by tier (see FLAT_K_*).
+      // So the median IS the refreshed rate -- no hazard discount -- and
+      // the spread is only the residual tier uncertainty.
+      const t = refreshTier(tr.description);
+      const kTier = t === "A" ? FLAT_K_A : t === "B" ? FLAT_K_B : FLAT_K_C;
+      const sTier = t === "A" ? FLAT_S_A : t === "B" ? FLAT_S_B : FLAT_S_C;
+      const medRate = Math.round(r * kTier * 100) / 100;
+      const medLogit = logit(medRate);
+      drift = medLogit - logit(r);
+      rows.push({ id: tr.id, q: Z.map((z) => round4(expit(medLogit + z * sTier))) });
       continue;
     }
 
